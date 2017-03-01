@@ -55,10 +55,15 @@ const FS: &'static str = "#version 150
                           texture(Texture, Frag_UV.st);
 		}";
 
+struct TextureEntry {
+    tex: glium::Texture2d,
+    sampler_opts: Option<glium::uniforms::SamplerBehavior>,
+}
+
 pub struct Drawer {
     cmd: NkBuffer,
     prg: glium::Program,
-    tex: Vec<glium::Texture2d>,
+    tex: Vec<TextureEntry>,
     vbf: Vec<Vertex>,
     ebf: Vec<u16>,
     vbo: glium::VertexBuffer<Vertex>,
@@ -68,9 +73,21 @@ pub struct Drawer {
 
 impl Drawer {
     pub fn new(display: &mut glium::Display, texture_count: usize, vbo_size: usize, ebo_size: usize, command_buffer: NkBuffer) -> Drawer {
+        // NOTE: By default, assume shaders output sRGB colors.
+        let program_creation_input = glium::program::ProgramCreationInput::SourceCode {
+            vertex_shader: VS,
+            fragment_shader: FS,
+            geometry_shader: None,
+            tessellation_control_shader: None,
+            tessellation_evaluation_shader: None,
+            transform_feedback_varyings: None,
+            outputs_srgb: true,
+            uses_point_size: false,
+        };
+
         Drawer {
             cmd: command_buffer,
-            prg: glium::Program::from_source(display, VS, FS, None).unwrap(),
+            prg: glium::Program::new(display, program_creation_input).unwrap(),
             tex: Vec::with_capacity(texture_count + 1),
             vbf: vec![Vertex::default(); vbo_size * ::std::mem::size_of::<Vertex>()],
             ebf: vec![0u16; ebo_size * ::std::mem::size_of::<u16>()],
@@ -86,7 +103,8 @@ impl Drawer {
         }
     }
 
-    pub fn add_texture(&mut self, display: &mut glium::Display, image: &[u8], width: u32, height: u32) -> NkHandle {
+    pub fn add_texture(&mut self, display: &mut glium::Display, image: &[u8], width: u32, height: u32,
+                       sampler_opts: Option<glium::uniforms::SamplerBehavior>) -> NkHandle {
         let image = glium::texture::RawImage2d {
             data: std::borrow::Cow::Borrowed(image),
             width: width,
@@ -95,13 +113,16 @@ impl Drawer {
         };
         let tex = glium::Texture2d::new(display, image).unwrap();
         let hnd = NkHandle::from_id(self.tex.len() as i32 + 1);
-        self.tex.push(tex);
+        self.tex.push(TextureEntry {
+            tex: tex,
+            sampler_opts: sampler_opts,
+        });
         hnd
     }
 
     pub fn draw(&mut self, ctx: &mut NkContext, cfg: &mut NkConvertConfig, frame: &mut glium::Frame, scale: NkVec2) {
         use glium::{Blend, DrawParameters, Rect};
-        use glium::uniforms::MagnifySamplerFilter;
+        use glium::uniforms::{MagnifySamplerFilter, MinifySamplerFilter};
         use glium::Surface;
 
         let (ww, hh) = frame.get_dimensions();
@@ -142,7 +163,8 @@ impl Drawer {
             }
 
             let id = cmd.texture().id().unwrap();
-            let ptr = self.find_res(id).unwrap();
+            let tex_entry = self.find_tex_entry(id).unwrap();
+            let ptr = &tex_entry.tex;
 
             idx_end = idx_start + cmd.elem_count() as usize;
 
@@ -151,12 +173,20 @@ impl Drawer {
             let w = cmd.clip_rect().w * scale.x;
             let h = cmd.clip_rect().h * scale.y;
 
+            let sampler = if let Some(sampler_opts) = tex_entry.sampler_opts {
+                glium::uniforms::Sampler(ptr, sampler_opts)
+            } else {
+                ptr.sampled()
+                    .magnify_filter(MagnifySamplerFilter::Linear)
+                    .minify_filter(MinifySamplerFilter::Nearest)
+            };
+
             frame.draw(&self.vbo,
                       &self.ebo.slice(idx_start..idx_end).unwrap(),
                       &self.prg,
                       &uniform! {
 			              ProjMtx: ortho,
-			              Texture: ptr.sampled().magnify_filter(MagnifySamplerFilter::Linear),
+			              Texture: sampler,
 			          },
                       &DrawParameters {
                           blend: Blend::alpha_blending(),
@@ -175,13 +205,11 @@ impl Drawer {
         }
     }
 
-    fn find_res(&self, id: i32) -> Option<&glium::Texture2d> {
-        let mut ret = None;
-
+    fn find_tex_entry(&self, id: i32) -> Option<&TextureEntry> {
         if id > 0 && id as usize <= self.tex.len() {
-            ret = Some(&self.tex[(id - 1) as usize]);
+            Some(&self.tex[(id - 1) as usize])
+        } else {
+            None
         }
-
-        ret
     }
 }
